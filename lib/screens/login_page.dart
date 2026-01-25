@@ -53,7 +53,7 @@ class _LoginPageState extends State<LoginPage> {
 
             Navigator.pushReplacement(
               context,
-              MaterialPageRoute(builder: (c) => MainScreen()),
+              MaterialPageRoute(builder: (c) => DriverMainScreen()),
             );
           } else {
             // ❌ NOT A DRIVER — Block login

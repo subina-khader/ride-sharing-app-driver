@@ -46,7 +46,7 @@ class _CarInfoScreenState extends State<CarInfoScreen> {
 
     Navigator.pushReplacement(
       context,
-      MaterialPageRoute(builder: (c) => MainScreen()),
+      MaterialPageRoute(builder: (c) => DriverMainScreen()),
     );
   }
 

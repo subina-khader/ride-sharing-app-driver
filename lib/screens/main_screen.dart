@@ -1,164 +1,248 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:trippo_mobile_app_driver/screens/login_page.dart';
-import 'package:trippo_mobile_app_driver/assistants/location_search_delegate.dart';
-import 'package:flutter_map/flutter_map.dart';
-import 'package:geolocator/geolocator.dart';
-import 'package:latlong2/latlong.dart';
-import 'package:geocoding/geocoding.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:trippo_mobile_app_driver/global/global.dart';
+import 'package:trippo_mobile_app_driver/screens/driver_map_screen.dart';
+import 'package:trippo_mobile_app_driver/screens/driver_trip_screen.dart';
+import 'package:trippo_mobile_app_driver/models/ride_request_model_driver.dart';
+import 'package:trippo_mobile_app_driver/models/driver_model.dart';
+import 'package:trippo_mobile_app_driver/widgets/ride_request_dialog.dart';
 
-class MainScreen extends StatefulWidget {
-  const MainScreen({super.key});
+class DriverMainScreen extends StatefulWidget {
+  const DriverMainScreen({super.key});
 
   @override
-  State<MainScreen> createState() => _MainScreenState();
+  State<DriverMainScreen> createState() => _DriverMainScreenState();
 }
 
-class _MainScreenState extends State<MainScreen> {
-  LatLng? currentLocation;
-  LatLng? fromLocation; // Separate from location for "From"
-  String? fromAddress;
-  String? toAddress;
-  LatLng? toLocation;
-  final MapController mapController = MapController();
-  StreamSubscription<Position>? _positionStream;
+class _DriverMainScreenState extends State<DriverMainScreen> {
+  int _selectedIndex = 0;
+  bool isDriverOnline = false;
+  StreamSubscription<DatabaseEvent>? _rideRequestsStream;
 
   @override
   void initState() {
     super.initState();
-    _initLocation();
+    _loadDriverData();
+    _checkDriverStatus();
   }
 
   @override
   void dispose() {
-    _positionStream?.cancel();
+    _rideRequestsStream?.cancel();
     super.dispose();
   }
 
-  Future<void> _initLocation() async {
-    await _checkPermission();
-    await _getCurrentLocation();
-    _listenToLocationChanges();
+  // Load driver data from Firebase
+  Future<void> _loadDriverData() async {
+    currentDriver = firebaseAuth.currentUser;
+
+    if (currentDriver != null) {
+      DatabaseReference driverRef = FirebaseDatabase.instance
+          .ref()
+          .child("drivers")
+          .child(currentDriver!.uid);
+
+      DatabaseEvent event = await driverRef.once();
+
+      if (event.snapshot.value != null) {
+        setState(() {
+          driverModelCurrentInfo = DriverModel.fromSnapshot(event.snapshot);
+        });
+        print("✅ Driver data loaded: ${driverModelCurrentInfo!.name}");
+        print("✅ Vehicle Type: ${driverModelCurrentInfo!.vehicleType}");
+        print("✅ Vehicle Model: ${driverModelCurrentInfo!.vehicleModel}");
+      } else {
+        print("❌ Driver data not found in Firebase");
+      }
+    }
   }
 
-  void _listenToLocationChanges() {
-    const LocationSettings locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 10,
-    );
+  void _checkDriverStatus() async {
+    if (currentDriver != null) {
+      DatabaseReference driverRef = FirebaseDatabase.instance
+          .ref()
+          .child("drivers")
+          .child(currentDriver!.uid);
 
-    _positionStream = Geolocator.getPositionStream(locationSettings: locationSettings)
-        .listen((Position pos) async {
-      LatLng newLocation = LatLng(pos.latitude, pos.longitude);
+      driverRef.child("status").once().then((snapshot) {
+        if (snapshot.snapshot.value != null) {
+          setState(() {
+            isDriverOnline = snapshot.snapshot.value == "online";
+          });
 
-      setState(() {
-        currentLocation = newLocation;
-        // Only update fromLocation if user hasn't manually selected a location
-        if (fromLocation == null) {
-          fromLocation = newLocation;
+          if (isDriverOnline) {
+            _listenToRideRequests();
+          }
         }
       });
-
-      // Only update fromAddress if user hasn't manually selected
-      if (fromLocation == currentLocation) {
-        String address = await _getAddressFromLatLng(newLocation);
-        setState(() {
-          fromAddress = address;
-        });
-      }
-    });
+    }
   }
 
-  Future<void> _checkPermission() async {
-    bool serviceEnabled;
-    LocationPermission permission;
-
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      await Geolocator.openLocationSettings();
+  void _listenToRideRequests() {
+    if (currentDriver == null) {
+      print("❌ currentDriver is null");
       return;
     }
 
-    permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        throw Exception('Location permission denied');
+    if (driverModelCurrentInfo == null) {
+      print("❌ driverModelCurrentInfo is null - driver data not loaded");
+      return;
+    }
+
+    print("🚗 Driver is now listening for ride requests...");
+    print("🚗 Looking for ${driverModelCurrentInfo!.vehicleType} requests");
+
+    DatabaseReference rideRequestsRef = FirebaseDatabase.instance
+        .ref()
+        .child("rideRequests");
+
+    _rideRequestsStream = rideRequestsRef.onChildAdded.listen((event) {
+      print("📢 Firebase event received!");
+
+      if (event.snapshot.value != null) {
+        try {
+          RideRequest rideRequest = RideRequest.fromSnapshot(event.snapshot);
+
+          print("📋 Request details:");
+          print("   Status: ${rideRequest.status}");
+          print("   Vehicle Type: ${rideRequest.vehicleType}");
+          print("   Driver Vehicle Type: ${driverModelCurrentInfo!.vehicleType}");
+
+          // Check if request matches
+          if (rideRequest.status == 'waiting' &&
+              rideRequest.vehicleType == driverModelCurrentInfo!.vehicleType) {
+
+            print("🔔 NEW RIDE REQUEST RECEIVED!");
+            print("   From: ${rideRequest.pickupAddress}");
+            print("   To: ${rideRequest.destinationAddress}");
+            print("   Fare: ₹${rideRequest.fare}");
+
+            _showRideRequestDialog(rideRequest);
+          } else {
+            print("⏭️  Request skipped (status: ${rideRequest.status}, type: ${rideRequest.vehicleType})");
+          }
+        } catch (e) {
+          print("❌ Error parsing ride request: $e");
+        }
       }
-    }
-
-    if (permission == LocationPermission.deniedForever) {
-      throw Exception(
-        'Location permissions are permanently denied, cannot request.',
-      );
-    }
-  }
-
-  Future<void> _getCurrentLocation() async {
-    Position pos = await Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-    );
-    LatLng loc = LatLng(pos.latitude, pos.longitude);
-    String address = await _getAddressFromLatLng(loc);
-
-    setState(() {
-      currentLocation = loc;
-      fromLocation = loc; // Set initial from location
-      fromAddress = address;
+    }, onError: (error) {
+      print("❌ Firebase listener error: $error");
     });
   }
 
-  Future<String> _getAddressFromLatLng(LatLng position) async {
-    try {
-      List<Placemark> placemarks = await placemarkFromCoordinates(
-        position.latitude,
-        position.longitude,
-      );
-      Placemark place = placemarks.first;
-      return "${place.street}, ${place.locality}";
-    } catch (e) {
-      return "Unknown location";
-    }
-  }
-
-  Future<void> _openSearchDialog({required bool isFrom}) async {
-    final result = await Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const LocationSearchScreen()),
+  void _showRideRequestDialog(RideRequest rideRequest) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => RideRequestDialog(
+        rideRequest: rideRequest,
+        onAccept: () {
+          Navigator.pop(context);
+          _acceptRideRequest(rideRequest);
+        },
+        onCancel: () {
+          Navigator.pop(context);
+          print("❌ Ride request declined");
+        },
+      ),
     );
+  }
 
-    if (result != null) {
-      LatLng selectedLocation = LatLng(
-        double.parse(result['lat']),
-        double.parse(result['lon']),
-      );
+  Future<void> _acceptRideRequest(RideRequest rideRequest) async {
+    if (currentDriver == null || driverModelCurrentInfo == null) return;
 
-      setState(() {
-        if (isFrom) {
-          fromAddress = result['display_name'];
-          fromLocation = selectedLocation;
-          // Update map center to show selected from location
-          mapController.move(selectedLocation, 15.0);
-        } else {
-          toAddress = result['display_name'];
-          toLocation = selectedLocation;
-        }
+    print("✅ Accepting ride request...");
+
+    try {
+      // Update ride request with driver info
+      DatabaseReference requestRef = FirebaseDatabase.instance
+          .ref()
+          .child("rideRequests")
+          .child(rideRequest.rideRequestId!);
+
+      await requestRef.update({
+        'status': 'accepted',
+        'driverId': currentDriver!.uid,
+        'driverName': driverModelCurrentInfo!.name,
+        'driverPhone': driverModelCurrentInfo!.phone,
+        'vehicleModel': driverModelCurrentInfo!.vehicleModel,
+        'vehicleNumber': driverModelCurrentInfo!.vehicleNumber,
       });
+
+      // Set driver as unavailable
+      DatabaseReference driverRef = FirebaseDatabase.instance
+          .ref()
+          .child("drivers")
+          .child(currentDriver!.uid);
+
+      await driverRef.update({
+        'isAvailable': false,
+      });
+
+      print("✅ Ride request accepted successfully!");
+      print("✅ Driver set to unavailable");
+
+      if (mounted) {
+        // Navigate to trip screen
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => DriverTripScreen(rideRequest: rideRequest),
+          ),
+        );
+      }
+    } catch (e) {
+      print("❌ Error accepting ride: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error accepting ride: $e')),
+        );
+      }
     }
   }
 
-  // Reset from location to current location
-  void _resetToCurrentLocation() {
-    if (currentLocation != null) {
-      _getAddressFromLatLng(currentLocation!).then((address) {
-        setState(() {
-          fromLocation = currentLocation;
-          fromAddress = address;
-          mapController.move(currentLocation!, 15.0);
-        });
+  void toggleDriverStatus() {
+    setState(() {
+      isDriverOnline = !isDriverOnline;
+    });
+
+    DatabaseReference driverRef = FirebaseDatabase.instance
+        .ref()
+        .child("drivers")
+        .child(currentDriver!.uid);
+
+    if (isDriverOnline) {
+      driverRef.update({
+        "status": "online",
+        "isAvailable": true,
       });
+      print("✅ Driver went online");
+      _listenToRideRequests();
+    } else {
+      driverRef.update({
+        "status": "offline",
+        "isAvailable": false,
+      });
+      driverRef.child("location").remove();
+      _rideRequestsStream?.cancel();
+      print("⏸️  Driver went offline");
     }
+  }
+
+  void _onItemTapped(int index) {
+    if (!isDriverOnline && index != 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Please go online first to access other sections"),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+    setState(() {
+      _selectedIndex = index;
+    });
   }
 
   @override
@@ -166,209 +250,192 @@ class _MainScreenState extends State<MainScreen> {
     bool darkTheme =
         MediaQuery.of(context).platformBrightness == Brightness.dark;
 
-    if (currentLocation == null) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
-    }
-
     return Scaffold(
-      body: Stack(
+      body: IndexedStack(
+        index: _selectedIndex,
         children: [
-          FlutterMap(
-            mapController: mapController,
-            options: MapOptions(
-              initialCenter: fromLocation ?? currentLocation!,
-              initialZoom: 15.0,
-              maxZoom: 18.0,
-              minZoom: 3.0,
-            ),
+          _buildHomeScreen(darkTheme),
+          _buildPlaceholderScreen("Earnings", darkTheme),
+          _buildPlaceholderScreen("Ratings", darkTheme),
+          _buildPlaceholderScreen("Account", darkTheme),
+        ],
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _selectedIndex,
+        onTap: _onItemTapped,
+        type: BottomNavigationBarType.fixed,
+        selectedItemColor: darkTheme ? Colors.amber.shade400 : Colors.blue,
+        unselectedItemColor: Colors.grey,
+        backgroundColor: darkTheme ? Colors.grey.shade900 : Colors.white,
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.home),
+            label: 'Home',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.account_balance_wallet),
+            label: 'Earnings',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.star),
+            label: 'Ratings',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.person),
+            label: 'Account',
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHomeScreen(bool darkTheme) {
+    if (!isDriverOnline) {
+      return Container(
+        color: Colors.black87,
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              TileLayer(
-                urlTemplate:
-                'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                subdomains: const ['a', 'b', 'c'],
-                userAgentPackageName: 'com.example.trippo_mobile_app',
+              Icon(
+                Icons.wifi_off,
+                size: 80,
+                color: Colors.grey.shade600,
               ),
-              MarkerLayer(
-                markers: [
-                  // From location marker
-                  if (fromLocation != null)
-                    Marker(
-                      point: fromLocation!,
-                      width: 40,
-                      height: 40,
-                      child: const Icon(
-                        Icons.location_on,
-                        color: Colors.green,
-                        size: 40,
-                      ),
-                    ),
-                  // To location marker
-                  if (toLocation != null)
-                    Marker(
-                      point: toLocation!,
-                      width: 40,
-                      height: 40,
-                      child: const Icon(
-                        Icons.location_on,
-                        color: Colors.red,
-                        size: 40,
-                      ),
-                    ),
-                ],
+              const SizedBox(height: 20),
+              Text(
+                "You are offline",
+                style: TextStyle(
+                  color: Colors.grey.shade400,
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                "Go online to start receiving ride requests",
+                style: TextStyle(
+                  color: Colors.grey.shade500,
+                  fontSize: 14,
+                ),
+              ),
+              const SizedBox(height: 40),
+              ElevatedButton(
+                onPressed: toggleDriverStatus,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.grey.shade800,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 60,
+                    vertical: 20,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(30),
+                  ),
+                ),
+                child: Text(
+                  "GO ONLINE",
+                  style: TextStyle(
+                    color: darkTheme ? Colors.amber.shade400 : Colors.blue,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
               ),
             ],
           ),
-          Positioned(
-            bottom: 0,
-            left: 0,
-            right: 0,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 50, 20, 20),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: darkTheme ? Colors.black : Colors.white,
-                      borderRadius: BorderRadius.circular(10),
+        ),
+      );
+    }
+
+    return Stack(
+      children: [
+        const DriverMapScreen(),
+        Positioned(
+          top: 50,
+          left: 20,
+          right: 20,
+          child: Container(
+            padding: const EdgeInsets.all(15),
+            decoration: BoxDecoration(
+              color: Colors.green,
+              borderRadius: BorderRadius.circular(10),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.2),
+                  blurRadius: 10,
+                  offset: const Offset(0, 5),
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.check_circle, color: Colors.white),
+                    SizedBox(width: 10),
+                    Text(
+                      "You are Online",
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
-                    child: Column(
-                      children: [
-                        Container(
-                          decoration: BoxDecoration(
-                            color: darkTheme
-                                ? Colors.grey.shade900
-                                : Colors.grey.shade100,
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Column(
-                            children: [
-                              Padding(
-                                padding: const EdgeInsets.all(5),
-                                child: GestureDetector(
-                                  onTap: () {
-                                    _openSearchDialog(isFrom: true);
-                                  },
-                                  child: Row(
-                                    children: [
-                                      Icon(
-                                        Icons.location_on_outlined,
-                                        color: darkTheme
-                                            ? Colors.amber.shade400
-                                            : Colors.blue,
-                                      ),
-                                      const SizedBox(width: 10),
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              'From',
-                                              style: TextStyle(
-                                                color: darkTheme
-                                                    ? Colors.amber.shade400
-                                                    : Colors.blue,
-                                                fontSize: 12,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                            ),
-                                            Text(
-                                              fromAddress ?? "Getting location...",
-                                              style: const TextStyle(
-                                                color: Colors.grey,
-                                                fontSize: 14,
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                              maxLines: 1,
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                      // Show reset button if from location is not current location
-                                      if (fromLocation != currentLocation)
-                                        IconButton(
-                                          icon: Icon(
-                                            Icons.my_location,
-                                            size: 20,
-                                            color: darkTheme
-                                                ? Colors.amber.shade400
-                                                : Colors.blue,
-                                          ),
-                                          onPressed: _resetToCurrentLocation,
-                                          tooltip: 'Use current location',
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 5),
-                              Divider(
-                                height: 1,
-                                thickness: 2,
-                                color: darkTheme
-                                    ? Colors.amber.shade400
-                                    : Colors.blue,
-                              ),
-                              const SizedBox(height: 5),
-                              Padding(
-                                padding: const EdgeInsets.all(5),
-                                child: GestureDetector(
-                                  onTap: () {
-                                    _openSearchDialog(isFrom: false);
-                                  },
-                                  child: Row(
-                                    children: [
-                                      Icon(
-                                        Icons.location_on_outlined,
-                                        color: darkTheme
-                                            ? Colors.amber.shade400
-                                            : Colors.blue,
-                                      ),
-                                      const SizedBox(width: 10),
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                          children: [
-                                            Text(
-                                              'To',
-                                              style: TextStyle(
-                                                color: darkTheme
-                                                    ? Colors.amber.shade400
-                                                    : Colors.blue,
-                                                fontSize: 12,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                            ),
-                                            Text(
-                                              toAddress ?? "Where to?",
-                                              style: const TextStyle(
-                                                color: Colors.grey,
-                                                fontSize: 14,
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                              maxLines: 1,
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
+                  ],
+                ),
+                ElevatedButton(
+                  onPressed: toggleDriverStatus,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 10,
                     ),
                   ),
-                ],
-              ),
+                  child: const Text(
+                    "GO OFFLINE",
+                    style: TextStyle(
+                      color: Colors.green,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
             ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPlaceholderScreen(String title, bool darkTheme) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            title == "Earnings"
+                ? Icons.account_balance_wallet
+                : title == "Ratings"
+                ? Icons.star
+                : Icons.person,
+            size: 80,
+            color: darkTheme ? Colors.amber.shade400 : Colors.blue,
+          ),
+          const SizedBox(height: 20),
+          Text(
+            "$title Screen",
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: darkTheme ? Colors.white : Colors.black,
+            ),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            "Coming soon...",
+            style: TextStyle(color: Colors.grey),
           ),
         ],
       ),
